@@ -1,0 +1,12 @@
+alias.st=status
+alias.co=checkout
+alias.ci=commit
+alias.br=branch
+user.email=erdong2018@163.com
+user.name=Erdong zhang
+core.editor=vim
+core.excludesfile=./.gitignore
+core.pager=less -F -X
+color.ui=auto
+oh-my-zsh.hide-status=1
+
