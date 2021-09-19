@@ -27,11 +27,26 @@ static void *exporter_kmap(struct dma_buf *dmabuf, unsigned long page_num)
 	return dmabuf->priv;
 }
 
+static void *exporter_vmap(struct dma_buf *dmabuf)
+{
+	return dmabuf->priv;
+}
+
+static int exporter_mmap(struct dma_buf *dmabuf,  struct vm_area_struct *vma)
+{
+	return 0;
+}
+
+
+
 static const struct dma_buf_ops exp_dmabuf_ops = {
 	.map_dma_buf = exporter_map_dma_buf,
 	.unmap_dma_buf = exporter_unmap_dma_buf,
 	.release = exporter_release,
 	.map = exporter_kmap,
+	.map_atomic = exporter_kmap,
+	.mmap = exporter_mmap,
+	.vmap = exporter_vmap,
 };
 
 struct dma_buf *exporter_alloc_page(void)
@@ -45,9 +60,10 @@ struct dma_buf *exporter_alloc_page(void)
 	exp_info.size = PAGE_SIZE;
 	exp_info.flags = O_CLOEXEC;
 	exp_info.priv = vaddr;
-	
+	pr_info("11111111111111");	
 	sprintf(vaddr, "Hello world\n");
 	
+	pr_info("11111111111111");	
 	return dma_buf_export(&exp_info);
 }
 
