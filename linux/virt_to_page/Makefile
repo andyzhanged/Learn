@@ -1,6 +1,6 @@
-obj-m += importer-dummy.o
+obj-m += mmap.o
 CFLAGS_MODULE += -g
-KBUILD_EXTRA_SYMBOLS += /home/hygon/zhanged/dma_buf/exporter/Module.symvers
+
 all:
 	make -C /lib/modules/$(shell uname -r)/build KBUILD_EXTMOD=$(PWD) modules
 

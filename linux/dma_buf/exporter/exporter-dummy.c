@@ -5,16 +5,37 @@
 struct dma_buf *dmabuf_exported;
 EXPORT_SYMBOL(dmabuf_exported);
 
+static int exporter_attach(struct dma_buf *dmabuf, struct device *dev,
+		struct dma_buf_attachment *attachment)
+{
+	pr_info("dmabuf attach device: %s\n", dev_name(dev));
+	return 0;
+}
+
+static void exporter_detach(struct dma_buf *dmabuf, struct dma_buf_attachment *attachment)
+{
+	pr_info("dmabuf attach device: %s\n", dev_name(attachment->dev));
+}
+
 static struct sg_table *exporter_map_dma_buf(struct dma_buf_attachment *attach,
 											 enum dma_data_direction dir)
 {
-	return NULL;
+	void *vaddr = attach->dmabuf->priv;
+	struct sg_table *table;
+	table = kmalloc(sizeof(*table), GFP_KERNEL);
+
+	sg_alloc_table(table, 1, GFP_KERNEL);
+	sg_dma_len(table->sgl) = PAGE_SIZE;
+	sg_dma_address(table->sgl) = dma_map_single(attach->dev, vaddr, PAGE_SIZE, dir);
+	return table;
 }
 
 static void exporter_unmap_dma_buf(struct dma_buf_attachment *attach,
         struct sg_table *table, enum dma_data_direction dir)
 {
-
+	dma_unmap_single(NULL, sg_dma_address(table->sgl), PAGE_SIZE, dir);
+	sg_free_table(table);
+	kfree(table);
 }
 
 static void exporter_release(struct dma_buf *dmabuf)
@@ -40,6 +61,8 @@ static int exporter_mmap(struct dma_buf *dmabuf,  struct vm_area_struct *vma)
 
 
 static const struct dma_buf_ops exp_dmabuf_ops = {
+	.attach = exporter_attach,
+	.detach = exporter_detach,
 	.map_dma_buf = exporter_map_dma_buf,
 	.unmap_dma_buf = exporter_unmap_dma_buf,
 	.release = exporter_release,
@@ -60,7 +83,7 @@ struct dma_buf *exporter_alloc_page(void)
 	exp_info.size = PAGE_SIZE;
 	exp_info.flags = O_CLOEXEC;
 	exp_info.priv = vaddr;
-	pr_info("11111111111111");	
+	pr_info("vaddr is %p\n", vaddr);	
 	sprintf(vaddr, "Hello world\n");
 	
 	pr_info("11111111111111");	
