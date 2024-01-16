@@ -204,6 +204,9 @@ static struct dmirror_device *dmirror_page_to_device(struct page *page)
 	return dmirror_page_to_chunk(page)->mdevice;
 }
 
+/**
+ * 模拟dev建立页表
+*/
 static int dmirror_do_fault(struct dmirror *dmirror, struct hmm_range *range)
 {
 	unsigned long *pfns = range->hmm_pfns;
@@ -230,6 +233,8 @@ static int dmirror_do_fault(struct dmirror *dmirror, struct hmm_range *range)
 			entry = xa_tag_pointer(entry, DPT_XA_TAG_WRITE);
 		else if (WARN_ON(range->default_flags & HMM_PFN_WRITE))
 			return -EFAULT;
+
+		/*存储页表*/
 		entry = xa_store(&dmirror->pt, pfn, entry, GFP_ATOMIC);
 		if (xa_is_err(entry))
 			return xa_err(entry);
@@ -238,6 +243,23 @@ static int dmirror_do_fault(struct dmirror *dmirror, struct hmm_range *range)
 	return 0;
 }
 
+/*
+*  该函数主要清除device的页表
+*   当cpu尝试访问dev内存时，将dev mem迁移到cpu mem，之后调用该函数，清除页表
+migrate_fault test case 访问迁移到dev的cpu mem触发如下回溯。
+26464   26464   hmm-tests       dmirror_interval_invalidate
+        b'dmirror_interval_invalidate+0x1 [test_hmm]'
+        b'migrate_vma_setup+0x20c [kernel]'
+        b'dmirror_devmem_fault+0xc6 [test_hmm]'
+        b'do_swap_page+0x7b3 [kernel]'
+        b'handle_pte_fault+0x227 [kernel]'
+        b'__handle_mm_fault+0x3c0 [kernel]'
+        b'handle_mm_fault+0x119 [kernel]'
+        b'do_user_addr_fault+0x1a9 [kernel]'
+        b'exc_page_fault+0x81 [kernel]'
+        b'asm_exc_page_fault+0x27 [kernel]'
+
+*/
 static void dmirror_do_update(struct dmirror *dmirror, unsigned long start,
 			      unsigned long end)
 {
@@ -254,6 +276,33 @@ static void dmirror_do_update(struct dmirror *dmirror, unsigned long start,
 		xa_erase(&dmirror->pt, pfn);
 }
 
+/*
+* 调用的地方比较多
+
+68205   68205   hmm-tests       dmirror_interval_invalidate
+        b'dmirror_interval_invalidate+0x1 [test_hmm]'
+        b'unmap_vmas+0x15a [kernel]'
+        b'unmap_region+0xb3 [kernel]'
+        b'do_mas_align_munmap+0x2d6 [kernel]'
+        b'do_mas_munmap+0xe9 [kernel]'
+        b'__vm_munmap+0xbd [kernel]'
+        b'__x64_sys_munmap+0x1b [kernel]'
+        b'do_syscall_64+0x59 [kernel]'
+        b'entry_SYSCALL_64_after_hwframe+0x72 [kernel]'
+
+68205   68205   hmm-tests       dmirror_interval_invalidate
+        b'dmirror_interval_invalidate+0x1 [test_hmm]'
+        b'try_to_migrate_one+0xbe7 [kernel]'
+        b'rmap_walk_anon+0x16b [kernel]'
+        b'try_to_migrate+0x9a [kernel]'
+        b'migrate_device_unmap+0x399 [kernel]'
+        b'migrate_device_range+0x8b [kernel]'
+        b'dmirror_device_remove_chunks+0x11c [test_hmm]'
+        b'dmirror_fops_unlocked_ioctl+0x2b3 [test_hmm]'
+        b'__x64_sys_ioctl+0x9a [kernel]'
+        b'do_syscall_64+0x59 [kernel]'
+        b'entry_SYSCALL_64_after_hwframe+0x72 [kernel]
+*/
 static bool dmirror_interval_invalidate(struct mmu_interval_notifier *mni,
 				const struct mmu_notifier_range *range,
 				unsigned long cur_seq)
@@ -300,8 +349,13 @@ static int dmirror_range_fault(struct dmirror *dmirror,
 
 		range->notifier_seq = mmu_interval_read_begin(range->notifier);
 		mmap_read_lock(mm);
+
+		/**
+		 * 根据range->start查找cpu页表，并将结果保存到range->hmm_pfns中
+		*/
 		ret = hmm_range_fault(range);
 		mmap_read_unlock(mm);
+
 		if (ret) {
 			if (ret == -EBUSY)
 				continue;
@@ -317,6 +371,9 @@ static int dmirror_range_fault(struct dmirror *dmirror,
 		break;
 	}
 
+	/**
+	 * 模拟缺页中断，为dev建立页表
+	*/
 	ret = dmirror_do_fault(dmirror, range);
 
 	mutex_unlock(&dmirror->mutex);
@@ -370,12 +427,16 @@ static int dmirror_do_read(struct dmirror *dmirror, unsigned long start,
 		struct page *page;
 		void *tmp;
 
+		/*模拟dev查找页表*/
 		entry = xa_load(&dmirror->pt, pfn);
 		page = xa_untag_pointer(entry);
+		/*第一次读，没有页表，返回-ENOENT*/
 		if (!page)
 			return -ENOENT;
 
+		/*page 为sys memory*/
 		tmp = kmap(page);
+		/*读取sys mem，保存到dev mem*/
 		memcpy(ptr, tmp, PAGE_SIZE);
 		kunmap(page);
 
@@ -386,6 +447,9 @@ static int dmirror_do_read(struct dmirror *dmirror, unsigned long start,
 	return 0;
 }
 
+/**
+ * 模拟dev 读取sys mem
+*/
 static int dmirror_read(struct dmirror *dmirror, struct hmm_dmirror_cmd *cmd)
 {
 	struct dmirror_bounce bounce;
@@ -410,6 +474,10 @@ static int dmirror_read(struct dmirror *dmirror, struct hmm_dmirror_cmd *cmd)
 			break;
 
 		start = cmd->addr + (bounce.cpages << PAGE_SHIFT);
+
+		/**
+		 * 模拟dev的缺页中断，分配物理内存，建立页表
+		*/
 		ret = dmirror_fault(dmirror, start, end, false);
 		if (ret)
 			break;
@@ -615,12 +683,19 @@ static struct page *dmirror_devmem_alloc_page(struct dmirror_device *mdevice)
 	 * data and ignore rpage.
 	 */
 	if (dmirror_is_private_zone(mdevice)) {
+		/*
+		* 申请cpu mem来模拟dev mem
+		*/
 		rpage = alloc_page(GFP_HIGHUSER);
 		if (!rpage)
 			return NULL;
 	}
 	spin_lock(&mdevice->lock);
 
+	/*
+	* dpage可以理解为dev memory的page结构体
+	* 由 dmirror_allocate_chunk创建
+	*/
 	if (mdevice->free_pages) {
 		dpage = mdevice->free_pages;
 		mdevice->free_pages = dpage->zone_device_data;
@@ -769,6 +844,8 @@ static int dmirror_migrate_finalize_and_map(struct migrate_vma *args,
 		entry = BACKING_PAGE(dpage);
 		if (*dst & MIGRATE_PFN_WRITE)
 			entry = xa_tag_pointer(entry, DPT_XA_TAG_WRITE);
+
+		/*建立dev页表*/
 		entry = xa_store(&dmirror->pt, pfn, entry, GFP_ATOMIC);
 		if (xa_is_err(entry)) {
 			mutex_unlock(&dmirror->mutex);
@@ -880,6 +957,11 @@ static vm_fault_t dmirror_devmem_fault_alloc_and_copy(struct migrate_vma *args,
 			 page_to_pfn(spage), page_to_pfn(dpage));
 
 		lock_page(dpage);
+		
+		/*
+		*清除dev的页表，
+		*当dev访问start时，会触发缺页中断，dev driver负责填充页表
+		*/
 		xa_erase(&dmirror->pt, addr >> PAGE_SHIFT);
 		copy_highpage(dpage, spage);
 		*dst = migrate_pfn(page_to_pfn(dpage));
@@ -979,8 +1061,10 @@ static int dmirror_migrate_to_device(struct dmirror *dmirror,
 
 	start = cmd->addr;
 	end = start + size;
-	if (end < start)
+	if (end < start) {
+		printk("end %lx less than start %lx\n", end, start);
 		return -EINVAL;
+	}
 
 	/* Since the mm is for the mirrored process, get a reference first. */
 	if (!mmget_not_zero(mm))
@@ -990,6 +1074,10 @@ static int dmirror_migrate_to_device(struct dmirror *dmirror,
 	for (addr = start; addr < end; addr = next) {
 		vma = vma_lookup(mm, addr);
 		if (!vma || !(vma->vm_flags & VM_READ)) {
+			printk("look up vma failed, addr %lx\n", addr);
+			vma = vma_lookup(mm, addr + 2 * PAGE_SIZE);
+			printk("look up vma %lx, addr %lx\n", vma, addr + 2 * PAGE_SIZE);
+
 			ret = -EINVAL;
 			goto out;
 		}
@@ -1004,13 +1092,34 @@ static int dmirror_migrate_to_device(struct dmirror *dmirror,
 		args.end = next;
 		args.pgmap_owner = dmirror->mdevice;
 		args.flags = MIGRATE_VMA_SELECT_SYSTEM;
+
+		printk("start va from migrate to dev  %#lx\n", args.start);
+		printk("dmirror_migrate_to_device before vma_setup src %#lx, dst %#lx\n",
+		      *args.src, *args.dst);
+		/**
+		* 注意该函数很重要
+		* 该函数将会根据args.start查找页表，找到start对应的pfn
+		* 将以下printk打印的*args.src，右移6bit，即和userspace pagemap工具读出来的pfn一致。
+		*  至于为什么要由移6bit，见函数migrate_vma_collect_pmd中的代码：
+		*  mpfn = migrate_pfn(page_to_pfn(page))
+		* 另外，如果args->src没有对应的物理页，那么并不会触发缺页中断分配物理内存。
+		*/
 		ret = migrate_vma_setup(&args);
 		if (ret)
 			goto out;
+		printk("dmirror_migrate_to_device after vma_setup src %#lx dst %#lx\n",
+		      *args.src, *args.dst);
 
 		pr_debug("Migrating from sys mem to device mem\n");
 		dmirror_migrate_alloc_and_copy(&args, dmirror);
+		printk("dmirror_migrate_to_device after migrate_alloc_and_copy src %#lx	dst %#lx\n",
+		       *args.src, *args.dst);
+
 		migrate_vma_pages(&args);
+
+		/*
+		* cpu mem已经迁移到dev mem，下面建立dev页表
+		*/
 		dmirror_migrate_finalize_and_map(&args, dmirror);
 		migrate_vma_finalize(&args);
 	}
@@ -1042,11 +1151,12 @@ out:
 	return ret;
 }
 
-static void dmirror_mkentry(struct dmirror *dmirror, struct hmm_range *range,
-			    unsigned char *perm, unsigned long entry)
+__attribute__((__noinline__)) static void
+dmirror_mkentry(struct dmirror *dmirror, struct hmm_range *range,
+		unsigned char *perm, unsigned long entry)
 {
 	struct page *page;
-
+	printk("entry is %lx\n", entry);
 	if (entry & HMM_PFN_ERROR) {
 		*perm = HMM_DMIRROR_PROT_ERROR;
 		return;
@@ -1057,6 +1167,13 @@ static void dmirror_mkentry(struct dmirror *dmirror, struct hmm_range *range,
 	}
 
 	page = hmm_pfn_to_page(entry);
+	printk("zone device page %d type %d\n", is_zone_device_page(page),
+	       page->pgmap->type == MEMORY_DEVICE_PRIVATE);
+	/**
+	 * 由于page 被迁移到device 0，因此is_zone_device_page(page)返回1
+	 * 且 page->pgmap->type == MEMORY_DEVICE_PRIVATE 也是1。case中的其他
+	 * 几个page, 这两个值全是0.
+	*/
 	if (is_device_private_page(page)) {
 		/* Is the page migrated to this device or some other? */
 		if (dmirror->mdevice == dmirror_page_to_device(page))
@@ -1235,6 +1352,9 @@ static void dmirror_device_evict_chunk(struct dmirror_chunk *chunk)
 	src_pfns = kcalloc(npages, sizeof(*src_pfns), GFP_KERNEL);
 	dst_pfns = kcalloc(npages, sizeof(*dst_pfns), GFP_KERNEL);
 
+	/**
+	 * 根据start_pfn查找 src_pfns
+	*/
 	migrate_device_range(src_pfns, start_pfn, npages);
 	for (i = 0; i < npages; i++) {
 		struct page *dpage, *spage;
@@ -1247,17 +1367,37 @@ static void dmirror_device_evict_chunk(struct dmirror_chunk *chunk)
 			    !is_device_coherent_page(spage)))
 			continue;
 		spage = BACKING_PAGE(spage);
+
+		/**
+		 * 申请cpu mem，用于将dev mem迁移到cpu mem
+		 * 注意，这个dpage, 最终映射到user space的buffer->ptr
+		 * 可见hmm.migrate_release 测试case, 在HMM_DMIRROR_RELEASE之后
+		 * buffer->ptr对应的pfn对应dpage.
+		*/
 		dpage = alloc_page(GFP_HIGHUSER_MOVABLE | __GFP_NOFAIL);
 		lock_page(dpage);
+
+		/*不太明白这里在拷贝什么*/
 		copy_highpage(dpage, spage);
+		printk("dmirror_device_evict_chunk pfn %#lx\n",
+		       page_to_pfn(dpage));
 		dst_pfns[i] = migrate_pfn(page_to_pfn(dpage));
 		if (src_pfns[i] & MIGRATE_PFN_WRITE)
 			dst_pfns[i] |= MIGRATE_PFN_WRITE;
 	}
+
+	/**
+	 * 提交拷贝任务，真正的开始执行拷贝 
+	 */
 	migrate_device_pages(src_pfns, dst_pfns, npages);
+
+	/**
+	 * 完成页迁移
+	 *  将会触发 dmirror_devmem_free, 释放dev memory.
+	 */
 	migrate_device_finalize(src_pfns, dst_pfns, npages);
 	kfree(src_pfns);
-	kfree(dst_pfns);
+	kfree(dst_pfns); 
 }
 
 /* Removes free pages from the free list so they can't be re-allocated */
@@ -1266,6 +1406,7 @@ static void dmirror_remove_free_pages(struct dmirror_chunk *devmem)
 	struct dmirror_device *mdevice = devmem->mdevice;
 	struct page *page;
 
+	/*将mdevice->free_pages指向了list的末尾，使得无法申请内存*/
 	for (page = mdevice->free_pages; page; page = page->zone_device_data)
 		if (dmirror_page_to_chunk(page) == devmem)
 			mdevice->free_pages = page->zone_device_data;
@@ -1405,6 +1546,50 @@ static const struct file_operations dmirror_fops = {
 	.owner		= THIS_MODULE,
 };
 
+/*
+
+69340   69340   hmm-tests       dmirror_devmem_free
+        b'dmirror_devmem_free+0x1 [test_hmm]'
+        b'__folio_put+0x55 [kernel]'
+        b'migrate_device_finalize+0x273 [kernel]'
+        b'dmirror_device_remove_chunks+0x24d [test_hmm]'
+        b'dmirror_fops_unlocked_ioctl+0x2b3 [test_hmm]'
+        b'__x64_sys_ioctl+0x9a [kernel]'
+        b'do_syscall_64+0x59 [kernel]'
+        b'entry_SYSCALL_64_after_hwframe+0x72 [kernel]'
+
+
+* user sapce的test case，尝试访问已经迁移到dev mem的cpu mem时：
+69970   69970   hmm-tests       dmirror_devmem_free
+        b'dmirror_devmem_free+0x1 [test_hmm]'
+        b'__folio_put+0x55 [kernel]'
+        b'put_page+0x60 [kernel]'
+        b'do_swap_page+0x7c3 [kernel]'
+        b'handle_pte_fault+0x227 [kernel]'
+        b'__handle_mm_fault+0x3c0 [kernel]'
+        b'handle_mm_fault+0x119 [kernel]'
+        b'do_user_addr_fault+0x1a9 [kernel]'
+        b'exc_page_fault+0x81 [kernel]'
+        b'asm_exc_page_fault+0x27 [kernel]'
+
+* 当user space test case的buffer->ptr unmap时：
+69970   69970   hmm-tests       dmirror_devmem_free
+        b'dmirror_devmem_free+0x1 [test_hmm]'
+        b'__folio_put+0x55 [kernel]'
+        b'put_page+0x60 [kernel]'
+        b'zap_pte_range+0x4a7 [kernel]'
+        b'zap_pmd_range.isra.0+0x1b6 [kernel]'
+        b'unmap_page_range+0x2ae [kernel]'
+        b'unmap_single_vma+0x7e [kernel]'
+        b'unmap_vmas+0xe5 [kernel]'
+        b'unmap_region+0xb3 [kernel]'
+        b'do_mas_align_munmap+0x2d6 [kernel]'
+        b'do_mas_munmap+0xe9 [kernel]'
+        b'__vm_munmap+0xbd [kernel]'
+        b'__x64_sys_munmap+0x1b [kernel]'
+        b'do_syscall_64+0x59 [kernel]'
+        b'entry_SYSCALL_64_after_hwframe+0x72 [kernel]'
+*/
 static void dmirror_devmem_free(struct page *page)
 {
 	struct page *rpage = BACKING_PAGE(page);
@@ -1417,13 +1602,53 @@ static void dmirror_devmem_free(struct page *page)
 	spin_lock(&mdevice->lock);
 
 	/* Return page to our allocator if not freeing the chunk */
+	/*
+	* 释放已经申请的 dev page
+	*/
 	if (!dmirror_page_to_chunk(page)->remove) {
 		mdevice->cfree++;
+		/*
+		* 更新mdevice->free_pages的头，指向新释放的page
+		*/
 		page->zone_device_data = mdevice->free_pages;
 		mdevice->free_pages = page;
 	}
 	spin_unlock(&mdevice->lock);
 }
+
+/*
+*  cpu缺页中断，将mem从dev迁移到cpu, callback如下
+
+105506  105506  hmm-tests       dmirror_devmem_fault
+        b'do_swap_page+0x7b3 [kernel]'
+        b'handle_pte_fault+0x227 [kernel]'
+        b'__handle_mm_fault+0x3c0 [kernel]'
+        b'handle_mm_fault+0x119 [kernel]'
+        b'do_user_addr_fault+0x1a9 [kernel]'
+        b'exc_page_fault+0x81 [kernel]'
+        b'asm_exc_page_fault+0x27 [kernel]'
+
+105514  105514  hmm-tests       dmirror_devmem_fault
+        b'do_swap_page+0x7b3 [kernel]'
+        b'handle_pte_fault+0x227 [kernel]'
+        b'__handle_mm_fault+0x3c0 [kernel]'
+        b'handle_mm_fault+0x119 [kernel]'
+        b'hmm_vma_fault+0x64 [kernel]'
+        b'hmm_vma_handle_pte.isra.0+0x6d [kernel]'
+        b'hmm_vma_walk_pmd+0x4f6 [kernel]'
+        b'walk_pmd_range.isra.0+0x113 [kernel]'
+        b'walk_pud_range.isra.0+0x1c6 [kernel]'
+        b'walk_p4d_range+0xe1 [kernel]'
+        b'walk_pgd_range+0x157 [kernel]'
+        b'__walk_page_range+0x17a [kernel]'
+        b'walk_page_range+0x16a [kernel]'
+        b'hmm_range_fault+0x52 [kernel]'
+        b'dmirror_fault+0x154 [test_hmm]'
+        b'dmirror_fops_unlocked_ioctl+0x40b [test_hmm]'
+        b'__x64_sys_ioctl+0x9a [kernel]'
+        b'do_syscall_64+0x59 [kernel]'
+        b'entry_SYSCALL_64_after_hwframe+0x72 [kernel]'		
+*/
 
 static vm_fault_t dmirror_devmem_fault(struct vm_fault *vmf)
 {
@@ -1452,12 +1677,22 @@ static vm_fault_t dmirror_devmem_fault(struct vm_fault *vmf)
 	args.flags = dmirror_select_device(dmirror);
 	args.fault_page = vmf->page;
 
+	/**
+	 * 根据args.start查找cpu的页表，找到对应的page，填充到args.src
+	 * */
+	printk("start va from cpu page fault  %#lx\n", args.start);
+	printk("before vma_setup args src %#lx dst %#lx\n", src_pfns, dst_pfns);
+	/*填充src_pfns*/
 	if (migrate_vma_setup(&args))
 		return VM_FAULT_SIGBUS;
+	printk("after vma_setup args src %#lx dst %#lx\n", src_pfns, dst_pfns);
 
+	/*填充dst_pfns*/
 	ret = dmirror_devmem_fault_alloc_and_copy(&args, dmirror);
 	if (ret)
 		return ret;
+	printk("after devmem_fault args src %#lx dst %#lx\n", src_pfns, dst_pfns);
+
 	migrate_vma_pages(&args);
 	/*
 	 * No device finalize step is needed since
