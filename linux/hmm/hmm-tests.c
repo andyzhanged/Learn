@@ -34,6 +34,7 @@
 #include "test_hmm_uapi.h"
 #include <gup_test.h>
 
+
 struct hmm_buffer {
 	void		*ptr;
 	void		*mirror;
@@ -280,7 +281,6 @@ static int hmm_migrate_dev_to_sys(int fd,
 TEST_F(hmm, open_close)
 {
 }
-
 #if 0
 /*
  * Read private anonymous memory.
@@ -304,9 +304,12 @@ TEST_F(hmm, anon_read)
 
 	buffer->fd = -1;
 	buffer->size = size;
+
+	/* mirror用于模拟dev mem，dev从cpu mem读取的结果保存在mirror中 */
 	buffer->mirror = malloc(size);
 	ASSERT_NE(buffer->mirror, NULL);
 
+	/* ptr是cpu mem，用于dev尝试读写*/
 	buffer->ptr = mmap(NULL, size,
 			   PROT_READ | PROT_WRITE,
 			   MAP_PRIVATE | MAP_ANONYMOUS,
@@ -326,10 +329,18 @@ TEST_F(hmm, anon_read)
 	ASSERT_EQ(ret, 0);
 
 	/* Populate the CPU page table with a special zero page. */
+	/* 前面2个page，被映射到zero page */
 	val = *(int *)(buffer->ptr + self->page_size);
 	ASSERT_EQ(val, 0);
 
 	/* Simulate a device reading system memory. */
+
+	/*
+	* 模拟dev读取cpu mem
+	* 1. dev尝试读取cpu mem
+	* 2. 发现没有页表，建立页表(模拟dev的缺页中断)
+	* 3. 建立页表后，返回步骤1
+	*/
 	ret = hmm_dmirror_cmd(self->fd, HMM_DMIRROR_READ, buffer, npages);
 	ASSERT_EQ(ret, 0);
 	ASSERT_EQ(buffer->cpages, npages);
@@ -337,6 +348,7 @@ TEST_F(hmm, anon_read)
 
 	/* Check what the device read. */
 	ptr = buffer->mirror;
+	/* 校验dev从cpu mem中读取的结果，前面两个page是0，后面的page被初始化*/
 	for (i = 0; i < 2 * self->page_size / sizeof(*ptr); ++i)
 		ASSERT_EQ(ptr[i], 0);
 	for (; i < size / sizeof(*ptr); ++i)
@@ -389,6 +401,11 @@ TEST_F(hmm, anon_read_prot)
 	ASSERT_EQ(ret, 0);
 
 	/* Simulate a device reading system memory. */
+
+	/*
+	* 由于cpu mem是PROT_NONE，dev无法读取
+	* hmm_range_fault查找cpu页表时返回-EFAULT
+	*/
 	ret = hmm_dmirror_cmd(self->fd, HMM_DMIRROR_READ, buffer, npages);
 	ASSERT_EQ(ret, -EFAULT);
 
@@ -405,8 +422,10 @@ TEST_F(hmm, anon_read_prot)
 	hmm_buffer_free(buffer);
 }
 
+
 /*
  * Write private anonymous memory.
+ * 模拟dev写cpu mem，和read流程相似
  */
 TEST_F(hmm, anon_write)
 {
@@ -452,6 +471,7 @@ TEST_F(hmm, anon_write)
 	hmm_buffer_free(buffer);
 }
 
+
 /*
  * Write private anonymous memory which has been protected with
  * mprotect() PROT_READ.
@@ -494,6 +514,7 @@ TEST_F(hmm, anon_write_prot)
 		ptr[i] = i;
 
 	/* Simulate a device writing system memory. */
+	/* cpu mem只有read权限，hmm_range_fault返回-EPERM*/
 	ret = hmm_dmirror_cmd(self->fd, HMM_DMIRROR_WRITE, buffer, npages);
 	ASSERT_EQ(ret, -EPERM);
 
@@ -522,6 +543,12 @@ TEST_F(hmm, anon_write_prot)
  * Check that a device writing an anonymous private mapping
  * will copy-on-write if a child process inherits the mapping.
  */
+
+/*
+ * 1. 父进程申请cpu private的mem，并初始化
+ * 2. 创建子进程，并模拟dev写cpu mem，校验是否写成功
+ * 3. 父进程读cpu mem，发现数据并未改变，即子进程模拟的dev写的是自己的cpu mem，不影响父进程
+ * /
 TEST_F(hmm, anon_write_child)
 {
 	struct hmm_buffer *buffer;
@@ -600,6 +627,12 @@ TEST_F(hmm, anon_write_child)
  * Check that a device writing an anonymous shared mapping
  * will not copy-on-write if a child process inherits the mapping.
  */
+
+/*
+ * 1. 父进程申请cpu shared的mem，并初始化
+ * 2. 创建子进程，并模拟dev写cpu mem，校验是否写成功
+ * 3. 父进程读cpu mem，发现数据改变，即子进程和父进程共享内存。
+ */
 TEST_F(hmm, anon_write_child_shared)
 {
 	struct hmm_buffer *buffer;
@@ -630,24 +663,24 @@ TEST_F(hmm, anon_write_child_shared)
 	ASSERT_NE(buffer->ptr, MAP_FAILED);
 
 	/* Initialize buffer->ptr so we can tell if it is written. */
+for (i = 0, ptr = buffer->ptr; i < size / sizeof(*ptr); ++i)
+	ptr[i] = i;
+
+/* Initialize data that the device will write to buffer->ptr. */
+for (i = 0, ptr = buffer->mirror; i < size / sizeof(*ptr); ++i)
+	ptr[i] = -i;
+
+pid = fork();
+if (pid == -1)
+	ASSERT_EQ(pid, 0);
+if (pid != 0) {
+	waitpid(pid, &ret, 0);
+	ASSERT_EQ(WIFEXITED(ret), 1);
+
+	/* Check that the parent's buffer did change. */
 	for (i = 0, ptr = buffer->ptr; i < size / sizeof(*ptr); ++i)
-		ptr[i] = i;
-
-	/* Initialize data that the device will write to buffer->ptr. */
-	for (i = 0, ptr = buffer->mirror; i < size / sizeof(*ptr); ++i)
-		ptr[i] = -i;
-
-	pid = fork();
-	if (pid == -1)
-		ASSERT_EQ(pid, 0);
-	if (pid != 0) {
-		waitpid(pid, &ret, 0);
-		ASSERT_EQ(WIFEXITED(ret), 1);
-
-		/* Check that the parent's buffer did change. */
-		for (i = 0, ptr = buffer->ptr; i < size / sizeof(*ptr); ++i)
-			ASSERT_EQ(ptr[i], -i);
-		return;
+		ASSERT_EQ(ptr[i], -i);
+	return;
 	}
 
 	/* Check that we see the parent's values. */
@@ -676,6 +709,7 @@ TEST_F(hmm, anon_write_child_shared)
 
 /*
  * Write private anonymous huge page.
+ * 模拟dev写cpu的透明大页
  */
 TEST_F(hmm, anon_write_huge)
 {
@@ -707,6 +741,8 @@ TEST_F(hmm, anon_write_huge)
 	size = TWOMEG;
 	npages = size >> self->page_shift;
 	map = (void *)ALIGN((uintptr_t)buffer->ptr, size);
+
+	/*要求 map地址开始的虚拟地址范围使用大页*/
 	ret = madvise(map, size, MADV_HUGEPAGE);
 	ASSERT_EQ(ret, 0);
 	old_ptr = buffer->ptr;
@@ -729,7 +765,7 @@ TEST_F(hmm, anon_write_huge)
 	buffer->ptr = old_ptr;
 	hmm_buffer_free(buffer);
 }
-#endif
+
 /*
  * Read numeric data from raw and tagged kernel status files.  Used to read
  * /proc and /sys data (without a tag) and from /proc/meminfo (with a tag).
@@ -777,9 +813,9 @@ static long file_read_ulong(char *file, const char *tag)
 
 	return val;
 }
-#if 0
 /*
  * Write huge TLBFS page.
+ * 模拟dev写cpu的标准大页
  */
 TEST_F(hmm, anon_write_hugetlbfs)
 {
@@ -837,7 +873,12 @@ TEST_F(hmm, anon_write_hugetlbfs)
 
 /*
  * Read mmap'ed file memory.
+ * 验证hmm是否可以读一个back为文件的cpu mem
+ * 1. 创建、初始化一个文件
+ * 2. 对该文件进行mmap，返回一个ptr
+ * 3. 模拟dev读ptr，校验内容
  */
+
 TEST_F(hmm, file_read)
 {
 	struct hmm_buffer *buffer;
@@ -892,7 +933,12 @@ TEST_F(hmm, file_read)
 
 /*
  * Write mmap'ed file memory.
+ * 验证hmm是否可以写一个back为文件的cpu mem
+ * 1. 创建、初始化一个文件
+ * 2. 对该文件进行mmap，返回一个ptr
+ * 3. 模拟dev写ptr，校验内容
  */
+
 TEST_F(hmm, file_write)
 {
 	struct hmm_buffer *buffer;
@@ -948,8 +994,10 @@ TEST_F(hmm, file_write)
 	hmm_buffer_free(buffer);
 }
 
+
 /*
  * Migrate anonymous memory to device private memory.
+ * 该case尝试将cpu mem迁移到dev mem中
  */
 TEST_F(hmm, migrate)
 {
@@ -994,6 +1042,7 @@ TEST_F(hmm, migrate)
 	hmm_buffer_free(buffer);
 }
 
+
 /*
  * Migrate anonymous memory to device private memory and fault some of it back
  * to system memory, then try migrating the resulting mix of system and device
@@ -1002,9 +1051,9 @@ TEST_F(hmm, migrate)
 /*
 * 1. 申请初始化cpu mem，此时cpu mem pfn已存在。
 * 2. 模拟dev访问dev mem，触发迁移cpu mem到dev mem。观察cpu mem的pfn，发现已被swapped。
-* 3. cpu 访问 cpu mem，触发内容从dev mem迁移到cpu mem。观察cpu mem，发现pfn和之前不一样
-*	 可见，内存是重新申请的。且此时dev 的页表会被清楚。
-* 4. 模拟dev 访问 dev mem，触发内容从cpu mem迁移会dev mem。
+* 3. cpu访问cpu mem，触发内容从dev mem迁移到cpu mem。观察cpu mem，发现pfn和之前不一样
+*	 可见，内存是重新申请的。且此时dev的页表会被清除。
+* 4. 模拟dev访问dev mem，触发内容从cpu mem迁移会dev mem。
 */
 TEST_F(hmm, migrate_fault)
 {
@@ -1071,16 +1120,14 @@ TEST_F(hmm, migrate_fault)
         b'do_user_addr_fault+0x1a9 [kernel]'
         b'exc_page_fault+0x81 [kernel]'
         b'asm_exc_page_fault+0x27 [kernel]'
+	
 
-	*/
-
-	/* 与此同时，缺页中断会将dev的页表清除
-	* 26464   26464   hmm-tests       dmirror_interval_invalidate
-        b'dmirror_interval_invalidate+0x1 [test_hmm]'
-        b'migrate_vma_setup+0x20c [kernel]'
-        b'dmirror_devmem_fault+0xc6 [test_hmm]'
-        b'do_swap_page+0x7b3 [kernel]'
-        b'handle_pte_fault+0x227 [kernel]'
+	 与此同时，缺页中断会将dev的页表清除
+	15655   15655   hmm-tests       dmirror_interval_invalidate ret 1
+        b'__mmu_notifier_invalidate_range_start+0x1a5 [kernel]'
+        b'wp_page_copy+0x5f5 [kernel]'
+        b'do_wp_page+0x205 [kernel]'
+        b'handle_pte_fault+0x25e [kernel]'
         b'__handle_mm_fault+0x3c0 [kernel]'
         b'handle_mm_fault+0x119 [kernel]'
         b'do_user_addr_fault+0x1a9 [kernel]'
@@ -1109,7 +1156,12 @@ TEST_F(hmm, migrate_fault)
 	hmm_buffer_free(buffer);
 }
 
-
+/*
+1. 申请cpu mem
+2. 迁移cpu mem到dev mem
+3. release dev mem，迁移dev mem到cpu mem，free dev mem
+4. 校验cpu mem的内容
+*/
 TEST_F(hmm, migrate_release)
 {
 	struct hmm_buffer *buffer;
@@ -1140,21 +1192,19 @@ TEST_F(hmm, migrate_release)
 	for (i = 0, ptr = buffer->ptr; i < size / sizeof(*ptr); ++i)
 		ptr[i] = i;
 
-	/** buffer->ptr状态
-	 * ./pagemap 73538 0x7fa6d4fff000 0x7fa6d4ffff00
-0x7fa6d4fff000     : pfn 111dfe           soft-dirty 1 file/shared 0 swapped 0 present 1
-	 * 
+	/* buffer->ptr状态
+	./pagemap 73538 0x7fa6d4fff000 0x7fa6d4ffff00
+	0x7fa6d4fff000     : pfn 111dfe           soft-dirty 1 file/shared 0 swapped 0 present 1
 	*/
 
 	/* Migrate memory to device. */
 	ret = hmm_migrate_sys_to_dev(self->fd, buffer, npages);
 	ASSERT_EQ(ret, 0);
-	ASSERT_EQ(buffer->cpages, npages);
+	ASSERT_EQ(buffer-> , npages);
 
-	/** 迁移到dev mem后，buffer->ptr状态
+	/* 迁移到dev mem后，buffer->ptr状态
 	 * ./pagemap 73538 0x7fa6d4fff000 0x7fa6d4ffff00
-0x7fa6d4fff000     : pfn fffffffb         soft-dirty 1 file/shared 0 swapped 1 present 0
-	 * 
+		0x7fa6d4fff000     : pfn fffffffb         soft-dirty 1 file/shared 0 swapped 1 present 0
 	*/
 
 	/* Check what the device read. */
@@ -1162,20 +1212,22 @@ TEST_F(hmm, migrate_release)
 		ASSERT_EQ(ptr[i], i);
 
 	/* Release device memory. */
+	/*
+	* release dev mem, 将dev mem的region全部释放掉，流程中将会出发mem从dev迁移会cpu
+	*/
 	ret = hmm_dmirror_cmd(self->fd, HMM_DMIRROR_RELEASE, buffer, npages);
 	ASSERT_EQ(ret, 0);
 
-	/** release dev memory后，buffer->ptr中的内容已从dev迁移回来。
+	/* release dev memory后，buffer->ptr中的内容已从dev迁移回来。
 	 *  ./pagemap 73538 0x7fa6d4fff000 0x7fa6d4ffff00
-0x7fa6d4fff000     : pfn 1a9e1            soft-dirty 1 file/shared 0 swapped 0 present 1
+		0x7fa6d4fff000     : pfn 1a9e1            soft-dirty 1 file/shared 0 swapped 0 present 1
 	*/
 
 	/* Fault pages back to system memory and check them. */
 
-	/**
-	* 我看了HMM_DMIRROR_RELEASE的代码，没有看太明白。但从试验得出了如下结论
-	 * 当device memory release后，cpu 在访问时(即下面的代码)，将不会触发缺页
-	 * 中断将dev memory迁移到cpu中。
+	/*
+	 * 由于device memory release流程中将mem迁移回了cpu，
+	 * cpu 在访问时(即下面的代码)，将不会触发缺页中断。
 	 */
 	for (i = 0, ptr = buffer->ptr; i < size / (2 * sizeof(*ptr)); ++i)
 		ASSERT_EQ(ptr[i], i);
@@ -1185,54 +1237,62 @@ TEST_F(hmm, migrate_release)
 
 /*
  * Migrate anonymous shared memory to device private memory.
+ * 1. 申请cpu mem，注意未初始化，意味着没有分配物理内存
+ * 2. 尝试迁移到dev mem时，无法找到src pfn
+ * 3. dev页表无法建立，所以读dev mem时驱动返回-ENOENT
  */
-	TEST_F(hmm, migrate_shared)
-	{
-		struct hmm_buffer *buffer;
-		unsigned long npages;
-		unsigned long size;
-		int ret;
+TEST_F(hmm, migrate_shared)
+{
+	struct hmm_buffer *buffer;
+	unsigned long npages;
+	unsigned long size;
+	int ret;
 
-		npages = ALIGN(HMM_BUFFER_SIZE, self->page_size) >>
-			 self->page_shift;
-		ASSERT_NE(npages, 0);
-		size = npages << self->page_shift;
-		printf("pid is %d\n", getpid());
-		sleep(10);
-		buffer = malloc(sizeof(*buffer));
-		ASSERT_NE(buffer, NULL);
+	npages = ALIGN(HMM_BUFFER_SIZE, self->page_size) >>
+			self->page_shift;
+	ASSERT_NE(npages, 0);
+	size = npages << self->page_shift;
+	printf("pid is %d\n", getpid());
+	sleep(10);
+	buffer = malloc(sizeof(*buffer));
+	ASSERT_NE(buffer, NULL);
 
-		buffer->fd = -1;
-		buffer->size = size;
-		buffer->mirror = malloc(size);
-		ASSERT_NE(buffer->mirror, NULL);
+	buffer->fd = -1;
+	buffer->size = size;
+	buffer->mirror = malloc(size);
+	ASSERT_NE(buffer->mirror, NULL);
 
-		buffer->ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
-				   MAP_SHARED | MAP_ANONYMOUS, buffer->fd, 0);
-		ASSERT_NE(buffer->ptr, MAP_FAILED);
+	buffer->ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
+				MAP_SHARED | MAP_ANONYMOUS, buffer->fd, 0);
+	ASSERT_NE(buffer->ptr, MAP_FAILED);
 
-		/**
-		 * 由于 buffer->ptr并未初始化，所以并没有分配物理内存
-		 * 随后，migrate_to_dev的kernel流程中，migrate_vma_setup无法
-		 * 找到对应的页表，所以实际上并未发生迁移. 在建立dev页表过程中
-		 * ，发现src不存在，也不会建dev页表.
-		*/
+	/**
+	 * 由于buffer->ptr并未初始化，所以并没有分配物理内存
+	 * 随后，migrate_to_dev的kernel流程中，migrate_vma_setup无法
+	 * 找到对应的页表，所以实际上并未发生迁移. 在建立dev页表过程中
+	 * ，发现src不存在，也不会建dev页表.
+	*/            
 
-		/* Migrate memory to device. */
-		ret = hmm_migrate_sys_to_dev(self->fd, buffer, npages);
+	/* Migrate memory to device. */
+	ret = hmm_migrate_sys_to_dev(self->fd, buffer, npages);
 
-		/**
-		 * dmirror_do_read找不到dev页表，返回-ENOENT
-		 */
-		ASSERT_EQ(ret, -ENOENT);
+	/**
+	 * dmirror_do_read找不到dev页表，返回-ENOENT
+	 */
+	ASSERT_EQ(ret, -ENOENT);
 
-		hmm_buffer_free(buffer);
+	hmm_buffer_free(buffer);
 }
-
-
 
 /*
  * Try to migrate various memory types to device private memory.
+ * 1. 申请没有读写权限的cpu mem
+ * 2. dev迁移cpu mem，返回-EINVAL
+ * 3. 将cpu mem的第2个page unmap掉(内核在处理时，会将第一个和第二个一起unmap)
+ * 4. dev尝试迁移cpu mem的前三个page，返回-EINVAL
+ * 5. cpu修改page 2为read only，并映射到zero page， page 4和5 为write，建立页表。
+ * 6. dev 1尝试将2 3 4 5迁移到dev 1，校验结果。
+ * 7. dev 0尝试将page 5迁移到dev 0，由于page 5在dev 1上，迁移失败。
  */
 TEST_F(hmm2, migrate_mixed)
 {
@@ -1331,9 +1391,9 @@ TEST_F(hmm2, migrate_mixed)
 	/* Page 5 won't be migrated to device 0 because it's on device 1. */
 	buffer->ptr = p + 5 * self->page_size;
 
-	/**
-	 * page 的状态
-	 *./pagemap 91564 0x7f96a8e0b000 0x7f96a8e0c000
+	/** 尝试迁移page 5到device 0
+	* page 的状态
+	*./pagemap 91564 0x7f96a8e0b000 0x7f96a8e0c000
 		0x7f96a8e0b000     : pfn ffdfff9b         soft-dirty 1 file/shared 0 swapped 1 present 0
 	* page 5当前是被swaped，migrate_vma_setup返回的pfn是0, 所以dev页表建立失败
 	*。 dmirror_do_read找不到页表，返回-ENOENT。
@@ -1354,6 +1414,15 @@ TEST_F(hmm2, migrate_mixed)
  * the pages from the device should be explicitly migrated back to system memory.
  * The reason is Coherent device zone has coherent access by CPU, therefore
  * it will not generate any page fault.
+ * 
+ * 1. 申请cpu内存并初始化
+ * 2. 迁移cpu mem到dev mem,并校验dev mem的数据
+ * 3. 迁移dev mem会到cpu mem
+ * 4. 重复以上步骤10次
+ * 
+ * 这里步骤3分为两种情况：
+ * 1. private dev memory，直接用cpu访问，缺页中断中do_swap_page会触发迁移。
+ * 2. coherent dev memory，需要driver显式的迁移到cpu mem
  */
 TEST_F(hmm, migrate_multiple)
 {
@@ -1469,7 +1538,7 @@ void *unmap_buffer(void *p)
 	struct hmm_buffer *buffer = p;
 
 	/* Delay for a bit and then unmap buffer while it is being read. */
-	hmm_nanosleep(hmm_random() % 32000);
+	//hmm_nanosleep(hmm_random() % 320000);
 	munmap(buffer->ptr + buffer->size / 2, buffer->size / 2);
 	buffer->ptr = NULL;
 
@@ -1478,6 +1547,12 @@ void *unmap_buffer(void *p)
 
 /*
  * Try reading anonymous memory while it is being unmapped.
+ * 1. 申请cpu mem，初始化cpu mem
+ * 2. 创建线程，随机的sleep一会儿，之后unmap cpu mem
+ * 3. 模拟dev读cpu mem，由于线程可能会在读之前unmap掉cpu mem，所以
+ *    该步骤可能会返回错误，unmap之后，hmm_range_faule查找页表时，返回-EFAULT
+ * 在实际测试中，步骤2随机sleep可能太久，也可能是创建线程比较耗时，所以并未出现将cpu mem
+ * unmap的情况。
  */
 TEST_F(hmm, anon_teardown)
 {
@@ -1517,7 +1592,6 @@ TEST_F(hmm, anon_teardown)
 
 		rc = pthread_create(&thread, NULL, unmap_buffer, buffer);
 		ASSERT_EQ(rc, 0);
-
 		/* Simulate a device reading system memory. */
 		rc = hmm_dmirror_cmd(self->fd, HMM_DMIRROR_READ, buffer,
 				     npages);
@@ -1539,6 +1613,7 @@ TEST_F(hmm, anon_teardown)
 
 /*
  * Test memory snapshot without faulting in pages accessed by the device.
+ * 模拟dev读取cpu页表的信息，如read、write 权限等。
  */
 TEST_F(hmm, mixedmap)
 {
@@ -1579,12 +1654,13 @@ TEST_F(hmm, mixedmap)
 	hmm_buffer_free(buffer);
 }
 
+
 /*
  * Test memory snapshot without faulting in pages accessed by the device.
  */
 
 /**
- * 读取页表的属性
+ * 模拟dev读取cpu页表的信息，如read、write权限、pud、pmd等。
 */
 TEST_F(hmm2, snapshot)
 {
@@ -1692,7 +1768,7 @@ TEST_F(hmm2, snapshot)
 
 	hmm_buffer_free(buffer);
 }
-
+  
 /*
  * Test the hmm_range_fault() HMM_PFN_PMD flag for large pages that
  * should be mapped by a large page table entry.
@@ -1771,6 +1847,12 @@ TEST_F(hmm, compound)
 
 /*
  * Test two devices reading the same memory (double mapped).
+ * 1. 申请cpu mem，并初始化，改变权限为只读
+ * 2. 模拟dev 0读cpu mem，并校验结果
+ * 3. 模拟dev 1读cpu mem，并校验结果
+ * 4. 迁移cpu mem到dev 1
+ * 5. 模拟dev 0读cpu mem，触发cpu mem从dev 1迁回cpu
+ * 
  */
 TEST_F(hmm2, double_map)
 {
@@ -1805,8 +1887,7 @@ TEST_F(hmm2, double_map)
 		ptr[i] = i;
 	/**
 	 *  ptr 物理内存状态
-	 * 	0x7f56fdf56000 : pfn 112d66 soft -
-			 dirty 1 file / shared 0 swapped 0 present 1
+	 * 	0x7f56fdf56000 : pfn 112d66 soft-dirty 1 file / shared 0 swapped 0 present 1
 	*/
 
 	/* Make region read-only. */
@@ -1822,7 +1903,7 @@ TEST_F(hmm2, double_map)
 	 *  ptr 物理内存状态
 	 * 	0x7f56fdf56000 : pfn 112d66 soft -
 			 dirty 1 file / shared 0 swapped 0 present 1
-	 * 可见，淡出的读，并不会将page swaped到dev。		 
+	 * 可见，dev读，并不会将page swaped到dev。		 
 	*/
 
 	/* Check what the device read. */
@@ -1846,8 +1927,8 @@ TEST_F(hmm2, double_map)
 
 	/** 至此 cpu mem的page被swaped到了dev 1 的mem。
 	 * zhanged-hyper# pagemap # ./pagemap 103985 0x7ff0791bd000 0x7ff0791bf000
-0x7ff0791bd000     : pfn ffdfff5c         soft-dirty 1 file/shared 0 swapped 1 present 0
-0x7ff0791be000     : pfn ffdfff7c         soft-dirty 1 file/shared 0 swapped 1 present 0
+		0x7ff0791bd000  : pfn ffdfff5c   soft-dirty 1 file/shared 0 swapped 1 present 0
+		0x7ff0791be000  : pfn ffdfff7c   soft-dirty 1 file/shared 0 swapped 1 present 0
 	*/
 
 	ret = hmm_dmirror_cmd(self->fd0, HMM_DMIRROR_READ, buffer, npages);
@@ -1856,8 +1937,8 @@ TEST_F(hmm2, double_map)
 	ASSERT_EQ(buffer->faults, 1);
 	/**
 	 * zhanged-hyper# pagemap # ./pagemap 103985 0x7ff0791bd000 0x7ff0791bf000
-0x7ff0791bd000     : pfn 116d08           soft-dirty 1 file/shared 0 swapped 0 present 1
-0x7ff0791be000     : pfn 116d09           soft-dirty 1 file/shared 0 swapped 0 present 1
+		0x7ff0791bd000  : pfn 116d08   soft-dirty 1 file/shared 0 swapped 0 present 1
+		0x7ff0791be000  : pfn 116d09   soft-dirty 1 file/shared 0 swapped 0 present 1
 	 * 可见，当dev 0尝试读cpu mem, mem被从dev 1 swaped会到了cpu mem。
 	*/
 
@@ -1870,6 +1951,11 @@ TEST_F(hmm2, double_map)
 
 /*
  * Basic check of exclusive faulting.
+ * 1. 申请cpu mem并初始化。
+ * 2. dev标记mem为专属于自己访问,并校验结果。
+ * 3. cpu访问mem，页从dev迁移会cpu
+ * 通过观察cpu mem对应的pfn状态，发现在3步骤时，并未触发migrate_to_ram中断。且此时cpu mem
+ * 的pfn和迁移之前的pfn一样。这两点和之前的case不同。
  */
 TEST_F(hmm, exclusive)
 {
@@ -1905,7 +1991,7 @@ TEST_F(hmm, exclusive)
 
 	/**
 	 * zhanged-hyper# pagemap # ./pagemap 107495 0x7fe05c5ff000 0x7fe05c5fff00
-0x7fe05c5ff000     : pfn 32390            soft-dirty 1 file/shared 0 swapped 0 present 1
+		0x7fe05c5ff000  : pfn 32390    soft-dirty 1 file/shared 0 swapped 0 present 1
 	*/
 	/* Map memory exclusively for device access. */
 
@@ -1915,7 +2001,7 @@ TEST_F(hmm, exclusive)
 
 	/**
 	 * zhanged-hyper# pagemap # ./pagemap 107495 0x7fe05c5ff000 0x7fe05c5fff00
-0x7fe05c5ff000     : pfn 64721d           soft-dirty 1 file/shared 0 swapped 1 present 0
+		0x7fe05c5ff000  : pfn 64721d    soft-dirty 1 file/shared 0 swapped 1 present 0
 	*/
 
 	/* Check what the device read. */
@@ -1924,7 +2010,7 @@ TEST_F(hmm, exclusive)
 
 	/* Fault pages back to system memory and check them. */
 	/**
-	 * 1. 迁移mem从dev 会到cpu mem。令我奇怪的是该步骤和之前的case不一样，并未触发dmirror_devmem_fault。
+	 * 1. 迁移mem从dev回到cpu mem。令我奇怪的是该步骤和之前的case不一样，并未触发dmirror_devmem_fault。
 	 * 	 那么是如何迁移回来的呢？而且迁移回来的pfn也是和迁移之前一样的，这和之前的case也不同。
 	 * 2. 校验结果
 	 * 3. 对ptr的每个值加1.
@@ -1934,7 +2020,7 @@ TEST_F(hmm, exclusive)
 
 	/**
 	 * zhanged-hyper# pagemap # ./pagemap 107495 0x7fe05c5ff000 0x7fe05c5fff00
-	0x7fe05c5ff000     : pfn 32390            soft-dirty 1 file/shared 0 swapped 0 present 1
+		0x7fe05c5ff000  : pfn 32390    soft-dirty 1 file/shared 0 swapped 0 present 1
 	*/
 
 	/*校验加1是否成功*/
@@ -1947,6 +2033,8 @@ TEST_F(hmm, exclusive)
 
 	hmm_buffer_free(buffer);
 }
+
+
 
 TEST_F(hmm, exclusive_mprotect)
 {
@@ -2002,9 +2090,12 @@ TEST_F(hmm, exclusive_mprotect)
 	hmm_buffer_free(buffer);
 }
 
-
 /*
  * Check copy-on-write works.
+* 1. 申请cpu mem并初始化。
+ * 2. dev标记mem为专属于自己访问,并校验结果。
+ * 3. fork出子进程
+ * 4. 父子进程均读写cpu mem,并校验结果
  */
 TEST_F(hmm, exclusive_cow)
 {
@@ -2054,6 +2145,7 @@ TEST_F(hmm, exclusive_cow)
 	hmm_buffer_free(buffer);
 }
 
+#endif
 static int gup_test_exec(int gup_fd, unsigned long addr, int cmd,
 			 int npages, int size, int flags)
 {
@@ -2078,6 +2170,43 @@ static int gup_test_exec(int gup_fd, unsigned long addr, int cmd,
  * and coherent type pages.
  * This test makes use of gup_test module. Make sure GUP_TEST_CONFIG is added
  * to your configuration before you run it.
+ * 
+ * 1. 申请cpu mem，初始化cpu mem
+ * 2. 将cpu mem迁移到dev mem
+ * 3. 之后尝试针对cpu mem调用get_user_pages、get_user_pages_fast等gup api, 尝试将
+ * 	  cpu mem从dev 迁移会cpu。
+ * 4. 读取cpu页表状态，最终校验cpu mem内容。
+ * 
+ * 该测试其实主要就是测试gup api能否触发mem从dev迁移会cpu.其call stack如下：
+PID     TID     COMM            FUNC             -
+5747    5747    hmm-tests       dmirror_devmem_fault ret 0
+        b'do_swap_page+0x7b3 [kernel]'
+        b'handle_pte_fault+0x227 [kernel]'
+        b'__handle_mm_fault+0x3c0 [kernel]'
+        b'handle_mm_fault+0x119 [kernel]'
+        b'__get_user_pages+0x247 [kernel]'
+        b'__gup_longterm_locked+0x218 [kernel]'
+        b'get_user_pages_unlocked+0x78 [kernel]'
+        b'internal_get_user_pages_fast+0xba [kernel]'
+        b'pin_user_pages_fast+0x21 [kernel]'
+        b'gup_test_ioctl+0x50a [gup_test]'
+        b'__x64_sys_ioctl+0x9a [kernel]'
+        b'do_syscall_64+0x59 [kernel]'
+        b'entry_SYSCALL_64_after_hwframe+0x72 [kernel]'
+
+5747    5747    hmm-tests       dmirror_devmem_fault ret 0
+        b'do_swap_page+0x7b3 [kernel]'
+        b'handle_pte_fault+0x227 [kernel]'
+        b'__handle_mm_fault+0x3c0 [kernel]'
+        b'handle_mm_fault+0x119 [kernel]'
+        b'__get_user_pages+0x247 [kernel]'
+        b'__gup_longterm_locked+0x218 [kernel]'
+        b'pin_user_pages+0x3b [kernel]'
+        b'gup_test_ioctl+0x1e9 [gup_test]'
+        b'__x64_sys_ioctl+0x9a [kernel]'
+        b'do_syscall_64+0x59 [kernel]'
+        b'entry_SYSCALL_64_after_hwframe+0x72 [kernel]'
+ * 
  */
 TEST_F(hmm, hmm_gup_test)
 {
@@ -2110,13 +2239,30 @@ TEST_F(hmm, hmm_gup_test)
 			   MAP_PRIVATE | MAP_ANONYMOUS,
 			   buffer->fd, 0);
 	ASSERT_NE(buffer->ptr, MAP_FAILED);
+	printf("pid is %d\n", getpid());
+	sleep(10);
 
+	/*
+	root@zhanged-hyper:~/pagemap# ./pagemap 5747 0x7f42a1ce6000 0x7f42a1ce8000
+	0x7f42a1ce6000 : pfn 0    soft-dirty 1 file/shared 0 swapped 0 present 0
+	0x7f42a1ce7000 : pfn 0    soft-dirty 1 file/shared 0 swapped 0 present 0
+	*/
 	/* Initialize buffer in system memory. */
 	for (i = 0, ptr = buffer->ptr; i < size / sizeof(*ptr); ++i)
 		ptr[i] = i;
+	/*
+	root@zhanged-hyper:~/pagemap# ./pagemap 5747 0x7f42a1ce6000 0x7f42a1ce8000
+	0x7f42a1ce6000  : pfn 14fb43    soft-dirty 1 file/shared 0 swapped 0 present 1
+	0x7f42a1ce7000  : pfn 14fa54    soft-dirty 1 file/shared 0 swapped 0 present 1
+	*/
 
 	/* Migrate memory to device. */
 	ret = hmm_migrate_sys_to_dev(self->fd, buffer, npages);
+	/*
+	root@zhanged-hyper:~/pagemap# ./pagemap 5747 0x7f42a1ce6000 0x7f42a1ce8000
+	0x7f42a1ce6000  : pfn fffffffb    soft-dirty 1 file/shared 0 swapped 1 present 0
+	0x7f42a1ce7000  : pfn ffffffdb    soft-dirty 1 file/shared 0 swapped 1 present 0
+	*/
 	ASSERT_EQ(ret, 0);
 	ASSERT_EQ(buffer->cpages, npages);
 	/* Check what the device read. */
@@ -2126,9 +2272,22 @@ TEST_F(hmm, hmm_gup_test)
 	ASSERT_EQ(gup_test_exec(gup_fd,
 				(unsigned long)buffer->ptr,
 				GUP_BASIC_TEST, 1, self->page_size, 0), 0);
+	/* get_user_pages将page 1迁移会cpu mem
+	root@zhanged-hyper:~/pagemap# ./pagemap 5747 0x7f42a1ce6000 0x7f42a1ce8000
+	0x7f42a1ce6000     : pfn 1695fa           soft-dirty 1 file/shared 0 swapped 0 present 1
+	0x7f42a1ce7000     : pfn ffffffdb         soft-dirty 1 file/shared 0 swapped 1 present 0
+	*/
+
 	ASSERT_EQ(gup_test_exec(gup_fd,
 				(unsigned long)buffer->ptr + 1 * self->page_size,
 				GUP_FAST_BENCHMARK, 1, self->page_size, 0), 0);
+
+	/* get_user_pages_fast将page 2迁移会cpu
+	root@zhanged-hyper:~/pagemap# ./pagemap 5747 0x7f42a1ce6000 0x7f42a1ce8000
+	0x7f42a1ce6000  : pfn 1695fa    soft-dirty 1 file/shared 0 swapped 0 present 1
+	0x7f42a1ce7000  : pfn 15355e    soft-dirty 1 file/shared 0 swapped 0 present 1
+	*/
+
 	ASSERT_EQ(gup_test_exec(gup_fd,
 				(unsigned long)buffer->ptr + 2 * self->page_size,
 				PIN_FAST_BENCHMARK, 1, self->page_size, FOLL_LONGTERM), 0);
@@ -2160,14 +2319,21 @@ TEST_F(hmm, hmm_gup_test)
 	close(gup_fd);
 	hmm_buffer_free(buffer);
 }
-#endif
 
+#if 0
 /*
  * Test copy-on-write in device pages.
  * In case of writing to COW private page(s), a page fault will migrate pages
  * back to system memory first. Then, these pages will be duplicated. In case
  * of COW device coherent type, pages are duplicated directly from device
  * memory.
+ * 
+ * 1. 申请并初始化cpu mem
+ * 2. 将cpu mem迁移到dev mem
+ * 3. fork创建子进程，子进程什么都不干，最终被父进程杀掉
+ * 4. 父进程写cpu mem，触发mem从dev 迁移会cpu
+ * 5. 杀掉子进程。
+ * 6. 读cpu mem的页表状态
  */
 TEST_F(hmm, hmm_cow_in_device)
 {
@@ -2197,17 +2363,26 @@ TEST_F(hmm, hmm_cow_in_device)
 			   MAP_PRIVATE | MAP_ANONYMOUS,
 			   buffer->fd, 0);
 	ASSERT_NE(buffer->ptr, MAP_FAILED);
-
+	printf("get pid %d\n", getpid());
+	sleep(10);
 	/* Initialize buffer in system memory. */
 	for (i = 0, ptr = buffer->ptr; i < size / sizeof(*ptr); ++i)
 		ptr[i] = i;
+	/**
+	zhanged-hyper# pagemap # ./pagemap 11331 0x7f1bb5ef6000 0x7f1bb5ef8000
+	0x7f1bb5ef6000 : pfn 17db92    soft-dirty 1 file/shared 0 swapped 0 present 1
+	0x7f1bb5ef7000 : pfn 184d4f    soft-dirty 1 file/shared 0 swapped 0 present 1
+	*/
 
 	/* Migrate memory to device. */
-
 	ret = hmm_migrate_sys_to_dev(self->fd, buffer, npages);
 	ASSERT_EQ(ret, 0);
 	ASSERT_EQ(buffer->cpages, npages);
-
+	/*
+	zhanged-hyper# pagemap # ./pagemap 11331 0x7f1bb5ef6000 0x7f1bb5ef8000
+	0x7f1bb5ef6000 : pfn ffffff9b    soft-dirty 1 file/shared 0 swapped 1 present 0
+	0x7f1bb5ef7000 : pfn ffffffbb    soft-dirty 1 file/shared 0 swapped 1 present 0
+	*/
 	pid = fork();
 	if (pid == -1)
 		ASSERT_EQ(pid, 0);
@@ -2222,8 +2397,15 @@ TEST_F(hmm, hmm_cow_in_device)
 	 * new copy in system. In case of device private pages,
 	 * this write causes a migration to system mem first.
 	 */
+	printf("get pid2 %d\n", getpid());
+	sleep(10);
 	for (i = 0, ptr = buffer->ptr; i < size / sizeof(*ptr); ++i)
 		ptr[i] = i;
+	/*
+	zhanged-hyper# pagemap # ./pagemap 11331 0x7f1bb5ef6000 0x7f1bb5ef8000
+	0x7f1bb5ef6000 : pfn 187482    soft-dirty 1 file/shared 0 swapped 0 present 1
+	0x7f1bb5ef7000 : pfn 186565    soft-dirty 1 file/shared 0 swapped 0 present 1
+	*/
 
 	/* Terminate child and wait */
 	EXPECT_EQ(0, kill(pid, SIGTERM));
@@ -2241,5 +2423,13 @@ TEST_F(hmm, hmm_cow_in_device)
 
 	hmm_buffer_free(buffer);
 }
+#endif
 
+TEST_F(hmm, test_mmap)
+{
+	printf("pid is %d\n", getpid());
+	sleep(10);
+	void *ptr = mmap(NULL, self->page_size, PROT_READ | PROT_WRITE,
+			 MAP_PRIVATE, self->fd, 0);
+}
 TEST_HARNESS_MAIN
