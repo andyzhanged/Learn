@@ -1,3 +1,7 @@
+#include <linux/memblock.h>
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/vmalloc.h>
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/mman.h>
@@ -14,6 +18,7 @@ static int probe_status = 0;
 static u64 addr = 0;
 static u64 size = SZ_16G;
 
+void dma_test_remove(struct pci_dev *pdev);
 static struct pci_device_id dma_test_dev_id[] = {
 	{
 		PCI_DEVICE(0x1e3e, 0x2),
@@ -30,7 +35,11 @@ static int dma_test_probe(struct pci_dev *pdev,
 	int n;
 	int ret;
 	u32 page_num_pinned = 0;
-
+    int i;  
+    struct scatterlist *sg; 
+    u64 dma_len = 0;
+    int count1 = 0;
+    int count0 = 0;
 	/* init dma*/
 	ret = dma_set_mask(&pdev->dev, DMA_BIT_MASK(48));
 	if (ret) {
@@ -42,7 +51,7 @@ static int dma_test_probe(struct pci_dev *pdev,
 		printk("dma_set_coherent_mask failed\n");
 		return ret;
 	}
-
+    dma_set_seg_boundary(&pdev->dev, 0xfffffff);
 	// alloc va
 	addr = vm_mmap(NULL, 0, size,
 				PROT_READ | PROT_WRITE,
@@ -85,6 +94,17 @@ static int dma_test_probe(struct pci_dev *pdev,
 	}
 	printk("alloc sg table success\n");
 
+	for_each_sg(sgt.sgl, sg, sg_nents(sgt.sgl), i){	
+		dma_len += sg->length;
+        count0++;
+        if (sg_dma_len(sg) == 0)
+            count1++;
+    }
+
+    printk("count0 %d count1 %d\n", count0, count1);
+	if (dma_len < size) {	
+		printk("dma len error in sg_alloc_table, dma_len %llx size %llx\n", dma_len, size);
+	}
 	// dma map
 	ret = dma_map_sg(&pdev->dev, sgt.sgl, sg_nents(sgt.sgl), DMA_BIDIRECTIONAL);
     if (unlikely(!ret)) {
@@ -93,7 +113,23 @@ static int dma_test_probe(struct pci_dev *pdev,
 		goto free_sg;
     }
 	probe_status = 1;
-
+    dma_len = 0;
+    i = 0;
+    count0 = 0;
+    count1 = 0;
+   	for_each_sg(sgt.sgl, sg, sg_nents(sgt.sgl), i){	
+		dma_len += sg_dma_len(sg);
+        count0++;
+        if (sg_dma_len(sg) == 0)
+        {
+            //printk("dma map sg len is 0\n");
+            count1++;
+        }
+	}
+    printk("count0 %d count1 %d dma_len %llx request len %llx\n", count0, count1, dma_len, size);
+	if (dma_len < size) {	
+		printk("dma len error in dma_map_sg dma_len %llx size %llx\n", dma_len, size);
+	} 
 	printk("dma map success\n");
 	return 0;
 
